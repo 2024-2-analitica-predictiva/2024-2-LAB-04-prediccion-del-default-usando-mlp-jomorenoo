@@ -96,3 +96,114 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+import os
+import gzip
+import pickle
+import json
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
+from sklearn.decomposition import PCA
+from sklearn.pipeline import Pipeline
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.neural_network import MLPClassifier
+from sklearn.metrics import (
+    precision_score,
+    recall_score,
+    f1_score,
+    balanced_accuracy_score,
+    confusion_matrix,
+)
+
+# Paso 1: Cargar y limpiar datos
+input_dir = "files/input"
+output_dir = "files/output"
+model_dir = "files/models"
+
+train_data = pd.read_csv(os.path.join(input_dir, "train.csv"))
+test_data = pd.read_csv(os.path.join(input_dir, "test.csv"))
+
+# Renombrar columna objetivo y eliminar columnas no necesarias
+for data in [train_data, test_data]:
+    data.rename(columns={"default payment next month": "default"}, inplace=True)
+    data.drop(columns=["ID"], inplace=True)
+
+# Eliminar registros con información no disponible
+train_data = train_data[(train_data != 0).all(axis=1)]
+test_data = test_data[(test_data != 0).all(axis=1)]
+
+# Agrupar niveles superiores de educación en "others"
+for data in [train_data, test_data]:
+    data["EDUCATION"] = data["EDUCATION"].apply(lambda x: 4 if x > 4 else x)
+
+# Paso 2: Dividir en conjuntos de características y etiquetas
+x_train, y_train = train_data.drop(columns="default"), train_data["default"]
+x_test, y_test = test_data.drop(columns="default"), test_data["default"]
+
+# Paso 3: Crear el pipeline
+pipeline = Pipeline(
+    [
+        ("encoder", OneHotEncoder(handle_unknown="ignore")),
+        ("scaler", MinMaxScaler()),
+        ("pca", PCA()),
+        ("select_kbest", SelectKBest(score_func=f_classif, k=10)),
+        ("mlp", MLPClassifier(max_iter=500)),
+    ]
+)
+
+# Paso 4: Optimizar hiperparámetros
+param_grid = {
+    "mlp__hidden_layer_sizes": [(50, 50), (100,)],
+    "mlp__alpha": [0.0001, 0.001, 0.01],
+    "mlp__learning_rate_init": [0.001, 0.01],
+}
+
+cv_model = GridSearchCV(
+    pipeline, param_grid, cv=10, scoring="balanced_accuracy", n_jobs=-1
+)
+cv_model.fit(x_train, y_train)
+
+# Guardar modelo
+os.makedirs(model_dir, exist_ok=True)
+model_path = os.path.join(model_dir, "model.pkl.gz")
+with gzip.open(model_path, "wb") as f:
+    pickle.dump(cv_model.best_estimator_, f)
+
+# Paso 5: Calcular métricas
+metrics = []
+for dataset, x, y, label in [
+    ("train", x_train, y_train, "train"),
+    ("test", x_test, y_test, "test"),
+]:
+    y_pred = cv_model.predict(x)
+    precision = precision_score(y, y_pred)
+    recall = recall_score(y, y_pred)
+    f1 = f1_score(y, y_pred)
+    balanced_accuracy = balanced_accuracy_score(y, y_pred)
+
+    metrics.append(
+        {
+            "dataset": label,
+            "precision": precision,
+            "balanced_accuracy": balanced_accuracy,
+            "recall": recall,
+            "f1_score": f1,
+        }
+    )
+
+    # Calcular matriz de confusión
+    cm = confusion_matrix(y, y_pred)
+    cm_dict = {
+        "type": "cm_matrix",
+        "dataset": label,
+        "true_0": {"predicted_0": cm[0, 0], "predicted_1": cm[0, 1]},
+        "true_1": {"predicted_0": cm[1, 0], "predicted_1": cm[1, 1]},
+    }
+    metrics.append(cm_dict)
+
+# Guardar métricas
+os.makedirs(output_dir, exist_ok=True)
+metrics_path = os.path.join(output_dir, "metrics.json")
+with open(metrics_path, "w") as f:
+    json.dump(metrics, f, indent=4)
